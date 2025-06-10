@@ -1,149 +1,123 @@
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <syslog.h>
+#include <unistd.h>
 #include <pthread.h>
-#include <unistd.h> // Para usleep
-#include <time.h>   // Para srand y rand
-#include <errno.h>  // Para manejar errores
+#include <time.h>
 
-// Incluir la implementación de nuestro ring buffer
-#include "atomic_event_ring_buffer.c" // Esto es solo para simplificar en un solo archivo.
-                                     // Normalmente, se incluiría el .h y se compilaría el .c por separado.
+// Incluir tu Ring Buffer
+#include "atomic_event_ring_buffer.c"
 
-#define NUM_PRODUCERS 2
-#define NUM_CONSUMERS 2
-#define EVENTS_PER_THREAD 1000000 // Millones de eventos por hilo
+#define NUM_PRODUCERS 8       // Más productores para saturar
+#define NUM_CONSUMERS 2       // Menos consumidores para desbalance
+#define EVENTS_PER_PRODUCER 500000 // Medio millón por productor
+#define CONSUMER_DELAY_US 10  // Retraso para simular VMM lento
 
-// Instancia global del ring buffer
-AtomicEventRingBuffer global_ring_buffer;
+// Contadores globales para verificación
+atomic_int total_produced = 0;
+atomic_int total_consumed = 0;
 
-// --- Hilo Productor ---
+// --- PRODUCTOR ---
 void* producer_thread(void* arg) {
     long thread_id = (long)arg;
     int success_count = 0;
-    int fail_count = 0;
+    syslog(LOG_INFO, "Producer %ld started", thread_id);
 
-    printf("Productor %ld: Iniciado.\n", thread_id);
-
-    for (long i = 0; i < EVENTS_PER_THREAD; ++i) {
-        Event event_to_enqueue = {
-            .pid = (uint32_t)(thread_id * 1000 + (i % 1000)), // PID único por hilo y evento
-            .vpn = (uint32_t)i                              // VPN simple
+    for (long i = 0; i < EVENTS_PER_PRODUCER; i++) {
+        Event event = {
+            .event_id = ((uint64_t)thread_id << 32) | i,
+            .pid = (uint32_t)(thread_id + 1000),
+            .vpn = (uint32_t)(i % 1024)
         };
-
-        if (enqueue_event(&global_ring_buffer, &event_to_enqueue) == 0) {
+        if (enqueue_event(&global_ring_buffer, &event) == 0) {
             success_count++;
+            atomic_fetch_add(&total_produced, 1);
         } else {
-            fail_count++;
-            // En un escenario real de kernel, un fallo aquí podría significar
-            // un reintento, una caída, o un manejo de backpressure más sofisticado.
-            // Para la prueba, solo contamos.
-            // usleep(1); // Pequeña pausa si está lleno para no saturar
+            usleep(1); // Backpressure
         }
     }
 
-    printf("Productor %ld: Finalizado. Añadidos: %d, Fallidos (Buffer Lleno): %d\n", thread_id, success_count, fail_count);
-    return (void*)(long)success_count; // Retorna el conteo de éxitos
+    syslog(LOG_INFO, "Producer %ld finished: %d events", thread_id, success_count);
+    return (void*)(long)success_count;
 }
 
-// --- Hilo Consumidor ---
+// --- CONSUMIDOR ---
 void* consumer_thread(void* arg) {
     long thread_id = (long)arg;
     int success_count = 0;
-    int fail_count = 0;
-    Event received_event;
+    Event event;
+    syslog(LOG_INFO, "Consumer %ld started", thread_id);
 
-    printf("Consumidor %ld: Iniciado.\n", thread_id);
-
-    // Los consumidores intentarán consumir hasta que los productores terminen
-    // y el buffer esté completamente vacío. En un sistema real,
-    // el consumidor podría esperar señales o tener un bucle infinito.
-    // Aquí hacemos un número fijo de intentos si el buffer está vacío.
-    long attempts_remaining = EVENTS_PER_THREAD * NUM_PRODUCERS * 2; // Intentos extra para vaciar el buffer
-
-    while (attempts_remaining > 0 || success_count < (EVENTS_PER_THREAD * NUM_PRODUCERS) / NUM_CONSUMERS) {
-        if (dequeue_event(&global_ring_buffer, &received_event) == 0) {
+    while (success_count < (EVENTS_PER_PRODUCER * NUM_PRODUCERS) / NUM_CONSUMERS) {
+        if (dequeue_event(&global_ring_buffer, &event) == 0) {
+            // Verificar integridad
+            uint32_t expected_pid = (event.event_id >> 32) + 1000;
+            if (event.pid != expected_pid) {
+                syslog(LOG_ERR, "Consumer %ld: Corrupted event %lu (PID %u, expected %u)",
+                       thread_id, event.event_id, event.pid, expected_pid);
+            }
             success_count++;
-            // printf("Consumidor %ld: Recibido PID=%u, VPN=%u\n", thread_id, received_event.pid, received_event.vpn);
+            atomic_fetch_add(&total_consumed, 1);
+            usleep(CONSUMER_DELAY_US); // Simular VMM lento
         } else {
-            fail_count++;
-            // usleep(1); // Pequeña pausa si está vacío
-        }
-        attempts_remaining--;
-        if (success_count >= (EVENTS_PER_THREAD * NUM_PRODUCERS) / NUM_CONSUMERS) {
-            break; // Si ya consumimos nuestra parte proporcional, salimos.
+            usleep(1);
         }
     }
 
-    printf("Consumidor %ld: Finalizado. Consumidos: %d, Fallidos (Buffer Vacío): %d\n", thread_id, success_count, fail_count);
-    return (void*)(long)success_count; // Retorna el conteo de éxitos
+    syslog(LOG_INFO, "Consumer %ld finished: %d events", thread_id, success_count);
+    return (void*)(long)success_count;
 }
 
-// --- Función Principal ---
-int main() {
-    srand(time(NULL)); // Inicializar generador de números aleatorios para los PID/VPNs de prueba
+// --- MAIN ---
+int main(void) {
+    openlog("RingBufferStress", LOG_PID|LOG_CONS, LOG_USER);
+    printf("--- Stress Testing Ring Buffer ---\n");
 
-    printf("--- Iniciando prueba de Ring Buffer Lock-Free ---\n");
-
-    // Inicializar el ring buffer
     ring_buffer_init(&global_ring_buffer);
 
-    pthread_t producers[NUM_PRODUCERS];
-    pthread_t consumers[NUM_CONSUMERS];
-    long total_produced = 0;
-    long total_consumed = 0;
-    long i;
+    pthread_t producers[NUM_PRODUCERS], consumers[NUM_CONSUMERS];
+    long total_success_produced = 0, total_success_consumed = 0;
 
-    // Crear hilos productores
-    for (i = 0; i < NUM_PRODUCERS; ++i) {
-        if (pthread_create(&producers[i], NULL, producer_thread, (void*)i) != 0) {
-            perror("Error al crear hilo productor");
-            return 1;
-        }
+    // Crear productores
+    for (long i = 0; i < NUM_PRODUCERS; i++) {
+        pthread_create(&producers[i], NULL, producer_thread, (void*)i);
     }
 
-    // Crear hilos consumidores
-    for (i = 0; i < NUM_CONSUMERS; ++i) {
-        if (pthread_create(&consumers[i], NULL, consumer_thread, (void*)i) != 0) {
-            perror("Error al crear hilo consumidor");
-            return 1;
-        }
+    // Crear consumidores
+    for (long i = 0; i < NUM_CONSUMERS; i++) {
+        pthread_create(&consumers[i], NULL, consumer_thread, (void*)i);
     }
 
-    // Esperar a que los hilos productores terminen
-    for (i = 0; i < NUM_PRODUCERS; ++i) {
-        long produced_by_thread;
-        pthread_join(producers[i], (void**)&produced_by_thread);
-        total_produced += produced_by_thread;
+    // Esperar productores
+    for (long i = 0; i < NUM_PRODUCERS; i++) {
+        long count;
+        pthread_join(producers[i], (void**)&count);
+        total_success_produced += count;
     }
 
-    // Esperar a que los hilos consumidores terminen
-    for (i = 0; i < NUM_CONSUMERS; ++i) {
-        long consumed_by_thread;
-        pthread_join(consumers[i], (void**)&consumed_by_thread);
-        total_consumed += consumed_by_thread;
+    // Esperar consumidores
+    for (long i = 0; i < NUM_CONSUMERS; i++) {
+        long count;
+        pthread_join(consumers[i], (void**)&count);
+        total_success_consumed += count;
     }
 
-    printf("\n--- Resumen de la Prueba ---\n");
-    printf("Total de eventos intentados por productores: %ld\n", EVENTS_PER_THREAD * NUM_PRODUCERS);
-    printf("Total de eventos añadidos exitosamente: %ld\n", total_produced);
-    printf("Total de eventos consumidos exitosamente: %ld\n", total_consumed);
+    // Verificar estado final
+    uint64_t head = atomic_load_explicit(&global_ring_buffer.head, memory_order_relaxed);
+    uint64_t tail = atomic_load_explicit(&global_ring_buffer.tail, memory_order_relaxed);
 
-    // Un pequeño delay para asegurar que el buffer esté completamente procesado
-    // antes de una posible verificación de head/tail final.
-    usleep(100000); // 100 ms
+    printf("\n--- Test Summary ---\n");
+    printf("Produced: %d, Consumed: %d\n", total_success_produced, total_success_consumed);
+    printf("Final state: Head=%lu, Tail=%lu\n", head, tail);
 
-    uint64_t final_head = atomic_load_explicit(&global_ring_buffer.head, memory_order_relaxed);
-    uint64_t final_tail = atomic_load_explicit(&global_ring_buffer.tail, memory_order_relaxed);
-
-    printf("Estado final del buffer: Head=%lu, Tail=%lu\n", final_head, final_tail);
-
-    if (total_produced == total_consumed && final_head == final_tail) {
-        printf("¡Prueba de Ring Buffer Lock-Free: ÉXITO! Todos los eventos procesados consistentemente.\n");
+    if (total_success_produced == total_success_consumed && head == tail) {
+        printf("SUCCESS: All events processed correctly\n");
     } else {
-        printf("¡Prueba de Ring Buffer Lock-Free: FALLO! Discrepancia en conteo o estado final.\n");
+        printf("FAILURE: Inconsistent state\n");
     }
 
-    printf("--- Fin de la Demostración ---\n");
-
+    closelog();
     return 0;
 }
